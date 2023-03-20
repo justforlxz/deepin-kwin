@@ -19,16 +19,9 @@
 #include <qdbusreply.h>
 #include <QGSettings/qgsettings.h>
 #include <QImageReader>
+#include "deepin_kwineffects.h"
 #include "workspace.h"
 //#include "multitouchgesture.h"       //to do
-
-Q_GLOBAL_STATIC_WITH_ARGS(QGSettings, _gsettings_dde_dock, ("com.deepin.dde.dock"))
-//Q_GLOBAL_STATIC_WITH_ARGS(QGSettings, _gsettings_dde_dock_primary, ("com.deepin.dde.dock.mainwindow"))
-#define GsettingsDockPosition   "position"
-//#define GsettingsDockBottom     "bottom"
-//#define GsettingsDockPrimary    "only-show-primary"
-#define GsettingsDockHeight     "window-size-efficient"
-//#define GsettingsDockShow       "hide-mode"
 
 #define BRIGHTNESS  0.4
 #define SCALE_F     1.0
@@ -595,7 +588,6 @@ MultitaskViewEffect::MultitaskViewEffect()
 
     connect(this, &MultitaskViewEffect::sigAddNewDesktop, this, &MultitaskViewEffect::onAddNewDesktop);
 
-    connect(_gsettings_dde_dock, &QGSettings::changed, this, &MultitaskViewEffect::onDockChange);
     m_hoverWinShader = ShaderManager::instance()->generateShaderFromFile(ShaderTrait::MapTexture | ShaderTrait::Modulate, QString(), QStringLiteral(":/effects/multitaskview/shaders/windowhover.frag"));
     m_previewShader = ShaderManager::instance()->generateShaderFromFile(ShaderTrait::MapTexture, QString(), QStringLiteral(":/effects/multitaskview/shaders/workspacethumb.frag"));
 
@@ -936,15 +928,6 @@ void MultitaskViewEffect::postPaintScreen()
         m_effectFlyingBack.end();
         setActive(false);
         QTimer::singleShot(400, [&]() { m_delayDbus = true; });
-        if (QX11Info::isPlatformX11() && m_dockRect.contains(m_cursorPos) && m_dockRect.contains(QCursor::pos()) && m_buttonType != 0) {
-            relayDockEvent(m_cursorPos, m_buttonType);
-            m_cursorPos.setX(0);
-            m_cursorPos.setY(0);
-            m_buttonType = 0;
-        } else if (!QX11Info::isPlatformX11() && m_sendDockButton != Qt::NoButton) {
-            effectsEx->sendPointer(m_sendDockButton);
-            m_sendDockButton = Qt::NoButton;
-        }
     }
 }
 
@@ -1565,9 +1548,6 @@ void MultitaskViewEffect::onWindowClosed(EffectWindow *w)
 
     if (w->windowClass() == screen_recorder && w != m_screenRecorderMenu) {
         effects->startMouseInterception(this, Qt::PointingHandCursor);
-    } else if (w->isDock()) {
-        m_dock = nullptr;
-        m_dockRect.setSize(QSize(0, 0));
     }
 }
 
@@ -1576,10 +1556,7 @@ void MultitaskViewEffect::onWindowDeleted(EffectWindow *w)
     if (!m_activated)
         return;
 
-    if (w->isDock()) {
-        m_dock = nullptr;
-        m_dockRect.setSize(QSize(0, 0));
-    } else if (!QX11Info::isPlatformX11() && w->caption() == "dde-osd") {
+    if (!QX11Info::isPlatformX11() && w->caption() == "dde-osd") {
         m_isCloseScreenRecorder = false;
         return;
     } else if (w->windowClass() == screen_recorder && w != m_screenRecorderMenu) {
@@ -1601,11 +1578,7 @@ void MultitaskViewEffect::onWindowAdded(EffectWindow *w)
     if (!m_activated)
         return;
 
-    if (w->isDock()) {
-        m_dockRect = w->geometry();
-        m_dock = w;
-        onDockChange("");
-    } else if (!QX11Info::isPlatformX11() && w->caption() == "org.deepin.dde.lock") {
+    if (!QX11Info::isPlatformX11() && w->caption() == "org.deepin.dde.lock") {
         setActive(false);
     } else if (w->windowClass() == screen_recorder || m_isScreenRecorder) {
         if ((!QX11Info::isPlatformX11() && w->windowClass() != screen_recorder)
@@ -1634,31 +1607,6 @@ void MultitaskViewEffect::onCloseEffect(bool isSleepBefore)
 {
     if (isSleepBefore && isActive()) {
         setActive(false);
-    }
-}
-
-void MultitaskViewEffect::onDockChange(const QString &key)
-{
-    QString position = _gsettings_dde_dock->get(GsettingsDockPosition).toString();
-    int height = _gsettings_dde_dock->get(GsettingsDockHeight).toInt();
-    if (position == "bottom") {
-        if (m_dockRect.height() < height) {
-            m_dockRect.setY(m_dockRect.height() + m_dockRect.y() - height);
-            m_dockRect.setHeight(height);
-        }
-    } else if (position == "top") {
-        if (m_dockRect.height() < height) {
-            m_dockRect.setHeight(height);
-        }
-    } else if (position == "left") {
-        if (m_dockRect.width() < height) {
-            m_dockRect.setWidth(height);
-        }
-    } else if (position == "right") {
-        if (m_dockRect.width() < height) {
-            m_dockRect.setX(m_dockRect.width() + m_dockRect.x() - height);
-            m_dockRect.setWidth(height);
-        }
     }
 }
 
@@ -1763,23 +1711,18 @@ void MultitaskViewEffect::windowInputMouseEvent(QEvent* e)
     case QEvent::MouseMove:
     {
         QPoint diff = mouseEvent->pos() - m_lastWorkspaceMovePos;
-        if (!m_dockRect.contains(mouseEvent->pos())) {
-            if (target) {   // window hover
-                m_hoverWin = target;
-                m_hoverWinBtn = target;
+        if (target) {   // window hover
+            m_hoverWin = target;
+            m_hoverWinBtn = target;
+            m_hoverDesktop = -1;
+        } else if (!m_wasWorkspaceMove && (abs(diff.x()) > MOUSE_MOVE_MIN_DISTANCE || (abs(diff.y()) > MOUSE_MOVE_MIN_DISTANCE)) && m_aciveMoveDesktop != -1 && m_screen != nullptr) {     //workspace move
+            m_workspaceMoveStartPos = mouseEvent->pos();
+            m_wasWorkspaceMove = true;
+            m_hoverDesktop = -1;
+        } else if (isHoverWorkspace) {  // workspace hover
+            if (!checkHandlerWorkspace(mouseEvent->pos(), m_screen, m_hoverDesktop))
                 m_hoverDesktop = -1;
-            } else if (!m_wasWorkspaceMove && (abs(diff.x()) > MOUSE_MOVE_MIN_DISTANCE || (abs(diff.y()) > MOUSE_MOVE_MIN_DISTANCE)) && m_aciveMoveDesktop != -1 && m_screen != nullptr) {     //workspace move
-                m_workspaceMoveStartPos = mouseEvent->pos();
-                m_wasWorkspaceMove = true;
-                m_hoverDesktop = -1;
-            } else if (isHoverWorkspace) {  // workspace hover
-                if (!checkHandlerWorkspace(mouseEvent->pos(), m_screen, m_hoverDesktop))
-                    m_hoverDesktop = -1;
-                m_hoverWinBtn = nullptr;
-            } else {
-                m_hoverWinBtn = nullptr;
-                m_hoverDesktop = -1;
-            }
+            m_hoverWinBtn = nullptr;
         } else {
             m_hoverWinBtn = nullptr;
             m_hoverDesktop = -1;
@@ -1812,23 +1755,53 @@ void MultitaskViewEffect::windowInputMouseEvent(QEvent* e)
     case QEvent::MouseButtonPress:
         m_timer->setSingleShot(true);
         m_timer->start(250);
-        if (!m_dockRect.contains(mouseEvent->pos())) {
-            if (target) {       // window press
-                m_windowMove = target;
-                m_windowMoveDiff = mouseEvent->pos() - target->pos();
-            } else if (isHoverWorkspace && !isAddWorkspace) {   // workspace press
-                if (checkHandlerWorkspace(mouseEvent->pos(), screen, m_aciveMoveDesktop)) {
-                    m_screen = screen;
-                }
+        if (target) {       // window press
+            m_windowMove = target;
+            m_windowMoveDiff = mouseEvent->pos() - target->pos();
+        } else if (isHoverWorkspace && !isAddWorkspace) {   // workspace press
+            if (checkHandlerWorkspace(mouseEvent->pos(), screen, m_aciveMoveDesktop)) {
+                m_screen = screen;
             }
-            m_lastWorkspaceMovePos = mouseEvent->pos();
         }
+        m_lastWorkspaceMovePos = mouseEvent->pos();
 
         break;
     case QEvent::MouseButtonRelease:
         m_timer->stop();
-        if (!m_wasWindowMove && m_dockRect.contains(mouseEvent->pos())) {
+        if (!m_wasWindowMove) {
             m_delayDbus = false;
+            const auto windowsList = effects->stackingOrder();
+            for (const auto w : windowsList) {
+                if (!w->isDock()) {
+                    continue;
+                }
+                const auto geometry = w->clientGeometry();
+                const auto button = mouseEvent->button();
+                const auto pos = mouseEvent->pos();
+                if (geometry.contains(pos)) {
+                    auto cl = static_cast<EffectWindowImpl *>(w)->window();
+                    xcb_button_release_event_t c;
+                    memset(&c, 0, sizeof(c));
+
+                    c.response_type = XCB_BUTTON_PRESS;
+                    c.event = cl->window();
+                    c.event_x = pos.x() - geometry.x();
+                    c.event_y = pos.y() - geometry.y();
+                    c.detail = (button == 1 ? 1 : 3);  // 1 左键 3 右键
+                    xcb_send_event(connection(), false, c.event, XCB_EVENT_MASK_BUTTON_PRESS, reinterpret_cast<const char*>(&c));
+                    xcb_flush(connection());
+
+                    memset(&c, 0, sizeof(c));
+                    c.response_type = XCB_BUTTON_RELEASE;
+                    c.event = cl->window();
+                    c.event_x = pos.x() - geometry.x();
+                    c.event_y = pos.y() - geometry.y();
+                    c.detail = (button == 1 ? 1 : 3);
+                    xcb_send_event(connection(), false, c.event, XCB_EVENT_MASK_BUTTON_RELEASE, reinterpret_cast<const char*>(&c));
+                    xcb_flush(connection());
+                    break;
+                }
+            }
             if (QX11Info::isPlatformX11()) {
                 m_effectFlyingBack.begin();
                 effects->addRepaintFull();
@@ -2186,32 +2159,6 @@ void MultitaskViewEffect::grabbedKeyboardEvent(QKeyEvent* e)
     }
 }
 
-void MultitaskViewEffect::relayDockEvent(QPoint pos, int button)
-{
-    if (m_dock) {
-        auto cl = static_cast<EffectWindowImpl *>(m_dock)->window();
-        xcb_button_release_event_t c;
-        memset(&c, 0, sizeof(c));
-
-        c.response_type = XCB_BUTTON_PRESS;
-        c.event = cl->window();
-        c.event_x = pos.x() - m_dockRect.x();
-        c.event_y = pos.y() - m_dockRect.y();
-        c.detail = (button == 1 ? 1 : 3);  // 1 左键 3 右键
-        xcb_send_event(connection(), false, c.event, XCB_EVENT_MASK_BUTTON_PRESS, reinterpret_cast<const char*>(&c));
-        xcb_flush(connection());
-
-        memset(&c, 0, sizeof(c));
-        c.response_type = XCB_BUTTON_RELEASE;
-        c.event = cl->window();
-        c.event_x = pos.x() - m_dockRect.x();
-        c.event_y = pos.y() - m_dockRect.y();
-        c.detail = (button == 1 ? 1 : 3);
-        xcb_send_event(connection(), false, c.event, XCB_EVENT_MASK_BUTTON_RELEASE, reinterpret_cast<const char*>(&c));
-        xcb_flush(connection());
-    } // button release
-}
-
 bool MultitaskViewEffect::isActive() const
 {
     return m_activated && !effects->isScreenLocked();
@@ -2379,9 +2326,6 @@ void MultitaskViewEffect::setWinLayout(int desktop, const EffectWindowList &wind
                 workspacewmm.manage(w);
                 wmm.manage(w);
                 winList.push_back(w);
-            } else if (w->isDock()) {
-                m_dockRect = w->geometry();
-                m_dock = w;
             }
         }
 
